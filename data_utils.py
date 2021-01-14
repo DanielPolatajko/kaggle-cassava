@@ -4,30 +4,83 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, models, transforms
 import numpy as np
 import torch.nn as nn
+from sklearn.model_selection import StratifiedKFold
 
-def construct_datasets(data_path, batch_size, train_size=0.7, transform=None, shuffle=True):
+from typing import Any, Tuple
+
+
+class AlbumentationsImageFolder(datasets.ImageFolder):
     """
-    Utility function to create a dataloader for Pytorch with the images, split into a training and validation set
-    :param data_path: Path to the dataset
-    :param train_size: The size of the split for training and validation sets
-    :param batch_size: Batch size for model training
-    :param transform: Any transforms or augmentations to apply to the images in dataset
-    :param shuffle: Whether to shuffle the dataset at each epoch
-    :return:
+    Abstracts ImageFolder class to be compatible with albumentations transforms, basically same as DatasetFolder code
+    https://pytorch.org/docs/stable/_modules/torchvision/datasets/folder.html#ImageFolder
     """
 
-    # apply transforms if necessary
-    if transforms is not None:
-        image_data = datasets.ImageFolder(data_path, transform=transform)
-    else:
-        image_data = datasets.ImageFolder(data_path)
+    def __getitem__(self, index: int) -> Tuple[Any, Any]:
+        """
+        Args:
+            index (int): Index
 
-    # split into train and validation
-    mask = np.random.choice(len(image_data), int(train_size*len(image_data)), replace=False)
-    train_data = Subset(image_data, mask)
-    val_data = Subset(image_data, [x for x in range(len(image_data)) if x not in mask])
+        Returns:
+            tuple: (sample, target) where target is class_index of the target class.
+        """
+        path, target = self.samples[index]
+        sample = self.loader(path)
+        if self.transform is not None:
+            sample = self.transform(image=np.array(sample))['image']
+        if self.target_transform is not None:
+            target = self.target_transform(target)
 
-    return DataLoader(train_data, batch_size, shuffle), DataLoader(val_data, batch_size, shuffle)
+        return sample, target
+
+class DatasetConstructor:
+    """
+    Class to construct datasets for use with cross-validation
+    """
+
+    def __init__(self, data_path, batch_size, k=5, transform=None, shuffle=True):
+        self.data_path = data_path
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.transform = transform
+
+        if transform is not None:
+            self.image_data = AlbumentationsImageFolder(data_path)
+        else:
+            transform = transforms.Compose(
+                [transforms.ToTensor(),
+                 transforms.Resize((384, 384)),
+                 transforms.Normalize((0.4342, 0.4967, 0.3154),(0.2300, 0.2319, 0.2186))
+                 ]
+            )
+
+            self.image_data = datasets.ImageFolder(data_path, transform=transform)
+
+        self.folds = StratifiedKFold(n_splits=k)
+
+        self.labels = np.array(self.image_data.targets)
+
+        self.k = k
+
+        self.splits = []
+
+        for train, val in self.folds.split(np.zeros(len(self.labels)), self.labels):
+            self.splits.append([train,val])
+
+    def get_split(self, iteration):
+        train_idx, val_idx = self.splits[iteration]
+
+        # split into train and validation
+        train_data = Subset(self.image_data, train_idx)
+        val_data = Subset(self.image_data, val_idx)
+
+        if self.transform is not None:
+            train_data.dataset.transform = self.transform['train_transform']
+            val_data.dataset.transform = self.transform['eval_transform']
+
+        return DataLoader(train_data, self.batch_size, self.shuffle), DataLoader(val_data, self.batch_size, self.shuffle)
+
+
+
 
 def reshape_model(model, num_classes):
     """

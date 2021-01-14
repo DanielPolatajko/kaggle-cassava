@@ -6,32 +6,50 @@ import copy
 
 from tqdm import tqdm
 
+from loss import BiTemperedLogisticLoss
+import torch.optim as optim
+
 class Experimenter:
     """
     Class to construct Pytorch experiment
     """
 
-    def __init__(self, model, device, loss_function, optimiser, lr_scheduler, train_data, val_data, num_epochs):
+    def __init__(self, model, model_name, device, loss_function, optimiser, lr_scheduler, dataset, num_epochs, num_classes, early_stopping=True, patience=3, tta=5):
         """
         Add some fun hyperparameters
         :param model: The model we want to experiment with
+        :param model_name: The name for the model (to save)
         :param device: The device we want to run the experiment on
         :param loss_function: The loss function to optimise
         :param optimiser: The optimiser to use
         :param lr_scheduler: Learning rate scheduler
-        :param train_data: Training data for the learning task
-        :param val_data: Validation data for the learning task
+        :param dataset: A DatasetConstructor object that can be used to perform CV
+        :param num_epochs: The number of training epochs
+        :param early_stopping: Whether or not to stop training early if overfitting
+        :param patience: How many epochs to tolerate poorer validation accuracy for
         """
         self.model = model
+        self.init_model = copy.deepcopy(model.state_dict())
+        self.model_name = model_name
         self.device = device
         self.loss_function = loss_function
+
         self.optimiser = optimiser
         self.lr_scheduler = lr_scheduler
-        self.train_data = train_data
-        self.val_data = val_data
-        self.num_epochs = num_epochs
 
-    def training_epoch(self):
+        self.dataset = dataset
+        self.num_epochs = num_epochs
+        self.early_stopping = early_stopping
+        self.patience = patience
+        self.one_hot = False
+        self.tta = tta
+        self.num_classes = num_classes
+
+        if type(self.loss_function) == BiTemperedLogisticLoss:
+            print("one hot")
+            self.one_hot = True
+
+    def training_epoch(self, train_data):
         """
         Method to execute a training epoch
         :return:
@@ -41,8 +59,9 @@ class Experimenter:
         cumulative_loss = 0.0
         correct_preds = 0
 
-        with tqdm(self.train_data, unit="batch") as tepoch:
+        with tqdm(train_data, unit="batch") as tepoch:
             for inputs, labels in tepoch:
+
                 inputs = inputs.to(self.device)
                 labels = labels.to(self.device)
 
@@ -53,7 +72,12 @@ class Experimenter:
                 with torch.set_grad_enabled(True):
                     # Get model outputs and calculate loss
                     outputs = self.model(inputs)
-                    loss = self.loss_function(outputs, labels)
+                    if self.one_hot:
+                        one_hot_labels = torch.zeros(len(labels), self.num_classes).cuda()
+                        one_hot_labels[range(one_hot_labels.shape[0]), labels] = 1
+                        loss = self.loss_function(outputs, one_hot_labels)
+                    else:
+                        loss = self.loss_function(outputs, labels)
 
                     # make predictions
                     _, preds = torch.max(outputs, 1)
@@ -68,12 +92,12 @@ class Experimenter:
 
                 tepoch.set_postfix(loss=loss.item())
 
-            epoch_loss = cumulative_loss / len(self.train_data.dataset)
-            epoch_acc = correct_preds / len(self.train_data.dataset)
+            epoch_loss = cumulative_loss / len(train_data.dataset)
+            epoch_acc = correct_preds / len(train_data.dataset)
 
         return epoch_loss, epoch_acc
 
-    def validation_epoch(self):
+    def validation_epoch(self, val_data):
         """
         Method to execute a validation epoch
         :return:
@@ -83,28 +107,48 @@ class Experimenter:
         cumulative_loss = 0.0
         correct_preds = 0
 
-        for inputs, labels in self.train_data:
-            inputs = inputs.to(self.device)
-            labels = labels.to(self.device)
+        with tqdm(val_data, unit="batch") as tepoch:
 
-            # zero the parameter gradients
-            self.optimiser.zero_grad()
+            for inputs, labels in tepoch:
+                inputs = inputs.to(self.device)
+                labels = labels.to(self.device)
 
-            # forward pass
-            with torch.set_grad_enabled(False):
-                # Get model outputs and calculate loss
-                outputs = self.model(inputs)
-                loss = self.loss_function(outputs, labels)
+                # zero the parameter gradients
+                self.optimiser.zero_grad()
+
+                tta_individuals = torch.zeros((self.dataset.batch_size, self.num_classes)).cuda()
+
+                # we do test time augmentation for validation
+                for tta_ix in range(self.tta):
+
+                    # forward pass
+                    with torch.set_grad_enabled(False):
+                        # Get model outputs and calculate loss
+                        outputs = self.model(inputs)
+                        tta_individuals += outputs
+
+                # average the model predictions against augmentations
+                outputs = tta_individuals / self.tta
+
+                # one hot encode the labels for bi-tempered logistic loss
+                if self.one_hot:
+                    one_hot_labels = torch.zeros(len(labels), self.num_classes).cuda()
+                    one_hot_labels[range(one_hot_labels.shape[0]), labels] = 1
+                    loss = self.loss_function(outputs, one_hot_labels)
+                else:
+                    loss = self.loss_function(outputs, labels)
 
                 # make predictions
                 _, preds = torch.max(outputs, 1)
 
-            # update loss and predictions
-            cumulative_loss += loss.item() * inputs.size(0)
-            correct_preds += torch.sum(preds == labels.data)
+                # update loss and predictions
+                cumulative_loss += loss.item() * inputs.size(0)
+                correct_preds += torch.sum(preds == labels.data)
 
-        epoch_loss = cumulative_loss / len(self.train_data.dataset)
-        epoch_acc = correct_preds / len(self.train_data.dataset)
+                tepoch.set_postfix(loss=loss.item())
+
+            epoch_loss = cumulative_loss / len(val_data.dataset)
+            epoch_acc = correct_preds / len(val_data.dataset)
 
         return epoch_loss, epoch_acc
 
@@ -114,55 +158,92 @@ class Experimenter:
         Method to train the model based on the given hyperparameters
         :return:
         """
-        start = time.time()
 
-        # keep losses and accuracies to plot training afterwards
-        stats = {
-            'train_losses': [],
-            'train_accs': [],
-            'val_losses': [],
-            'val_accs': []
-        }
 
-        best_model_params = copy.deepcopy(self.model.state_dict())
-        best_acc = 0.0
+        for fold in range(self.dataset.k):
 
-        for epoch in range(self.num_epochs):
-            print(f"Epoch {epoch+1}/{self.num_epochs}\n")
+            stopped_early = False
+            stopped_epoch = 10
 
-            # set model to training mode
-            self.model.train()
+            # instantiate and send the model to GPU
+            self.model.load_state_dict(self.init_model)
 
-            # do a training epoch to get loss and acc, and record them
-            train_loss, train_acc = self.training_epoch()
-            stats['train_losses'].append(train_loss)
-            stats['train_accs'].append(train_acc)
+            # initialise optimiser and lr scheduler
+            self.optimiser = optim.Adam(self.model.parameters(), lr=5e-4)
+            self.lr_scheduler = torch.optim.lr_scheduler.StepLR(self.optimiser, step_size=5, gamma=0.1) # TODO make dynamic
 
-            print(f"Training loss - Epoch {epoch+1}/{self.num_epochs}: {train_loss}")
-            print(f"Training accuracy - Epoch {epoch+1}/{self.num_epochs}: {train_acc}")
 
-            # set model to training mode
-            self.model.eval()
+            train_data, val_data = self.dataset.get_split(fold)
 
-            # do a training epoch to get loss and acc, and record them
-            val_loss, val_acc = self.validation_epoch()
-            stats['val_losses'].append(train_loss)
-            stats['val_accs'].append(train_acc)
+            start = time.time()
 
-            print(f"Validation loss - Epoch {epoch+1}/{self.num_epochs}: {val_loss}")
-            print(f"Validation accuracy - Epoch {epoch+1}/{self.num_epochs}: {val_acc}")
+            early_stopping_counter = 0
 
-            # keep a copy of the best performing model parameters
-            if val_acc > best_acc:
-                best_acc = val_acc
-                best_model_params = copy.deepcopy(self.model.state_dict())
+            # keep losses and accuracies to plot training afterwards
+            stats = {
+                'train_losses': [],
+                'train_accs': [],
+                'val_losses': [],
+                'val_accs': []
+            }
 
-            print()
+            best_model_params = copy.deepcopy(self.model.state_dict())
+            best_acc = 0.0
 
-        end = time.time() - start
-        print(f"Training finished in {end:.0f}m {end:.0f}s")
-        print(f"Best validation accuracy: {best_acc:4f}")
+            for epoch in range(self.num_epochs):
+                print(f"Epoch {epoch+1}/{self.num_epochs}\n")
 
-        # load best model weights
-        self.model.load_state_dict(best_model_params)
-        return self.model, stats
+                # set model to training mode
+                self.model.train()
+
+                # do a training epoch to get loss and acc, and record them
+                train_loss, train_acc = self.training_epoch(train_data)
+                stats['train_losses'].append(train_loss)
+                stats['train_accs'].append(train_acc)
+
+                print(f"Training loss - Epoch {epoch+1}/{self.num_epochs}: {train_loss}")
+                print(f"Training accuracy - Epoch {epoch+1}/{self.num_epochs}: {train_acc}")
+
+                # set model to training mode
+                self.model.eval()
+
+                # do a training epoch to get loss and acc, and record them
+                val_loss, val_acc = self.validation_epoch(val_data)
+                stats['val_losses'].append(train_loss)
+                stats['val_accs'].append(train_acc)
+
+                print(f"Validation loss - Epoch {epoch+1}/{self.num_epochs}: {val_loss}")
+                print(f"Validation accuracy - Epoch {epoch+1}/{self.num_epochs}: {val_acc}")
+
+                self.lr_scheduler.step()
+
+                if val_acc > best_acc:
+                    # keep a copy of the best performing model parameters
+                    best_acc = val_acc
+                    best_model_params = copy.deepcopy(self.model.state_dict())
+
+                    # dont early stop if model still improving
+                    early_stopping_counter = 0
+                else:
+
+                    # if validation accuracy goes down too much, model is overfitting so no point continuing
+                    early_stopping_counter += 1
+
+
+                if early_stopping_counter == self.patience and self.early_stopping:
+                    stopped_early = True
+                    stopped_epoch = epoch
+
+                    break
+
+            end = time.time() - start
+            if stopped_early:
+                print(f"Stopped training early after Epoch {stopped_epoch}")
+
+            print(f"Training finished in {end:.0f}m {end:.0f}s")
+            print(f"Best validation accuracy: {best_acc:4f}")
+
+
+            # load best model weights
+            self.model.load_state_dict(best_model_params)
+            torch.save(self.model, f"{self.model_name}_{fold}.pt")
