@@ -4,10 +4,10 @@
 import torch
 
 import torch.nn as nn
-import torch.nn.functional as F
 from torchvision.models.resnet import BasicBlock, Bottleneck, ResNet, _resnet
 from typing import Type, Any, Union, List
 import numpy as np
+import torch.nn.functional as F
 
 class SirenActivation(nn.Module):
     """
@@ -48,11 +48,12 @@ class SirenResNet(ResNet):
 
 # From torchvision.models.resnet, basically _resnet and resnext50_32x4d
 def _resnet(
+    architecture: Any,
     block: Type[Union[BasicBlock, Bottleneck]],
     layers: List[int],
     **kwargs: Any
 ) -> ResNet:
-    model = SirenResNet(block, layers, **kwargs)
+    model = architecture(block, layers, **kwargs)
     return model
 
 def siren(**kwargs: Any) -> ResNet:
@@ -64,7 +65,7 @@ def siren(**kwargs: Any) -> ResNet:
     """
     kwargs['groups'] = 32
     kwargs['width_per_group'] = 4
-    return _resnet(SirenBottleneck, [3, 4, 6, 3],**kwargs)
+    return _resnet(SirenResNet, SirenBottleneck, [3, 4, 6, 3],**kwargs)
 
 def initialise_weights(network):
     """
@@ -112,6 +113,73 @@ def initialise_weights(network):
 
 
     network.apply(uniform_distribution)
+
+class MishActivation(nn.Module):
+    """
+    Implements the Mish activation function as per https://arxiv.org/vc/arxiv/papers/1908/1908.08681v1.pdf
+    """
+
+    def __init__(self):
+        super(MishActivation, self).__init__()
+
+    def forward(self, x):
+        return x * (torch.tanh(F.softplus(x)))
+
+class MishBlock(BasicBlock):
+    """
+    Block for ResNet with Mish activation
+    """
+    def __init__(self, *args, **kwargs):
+        super(MishBlock, self).__init__(*args, **kwargs)
+        self.relu = MishActivation()
+
+class MishBottleneck(Bottleneck):
+    """
+    Bottleneck lock for ResNet with SIREN activation
+    """
+
+    def __init__(self, *args, **kwargs):
+        super(MishBottleneck, self).__init__(*args, **kwargs)
+        self.relu = MishActivation()
+
+class MishResNet(ResNet):
+    """
+    ResNet builder with the SIREN activation layer
+    """
+    def __init__(self, *args, **kwargs):
+        super(MishResNet, self).__init__(*args, **kwargs)
+        self.relu = SirenActivation()
+
+def mishnet(**kwargs: Any) -> ResNet:
+    r"""ResNeXt-50 32x4d model from
+    `"Aggregated Residual Transformation for Deep Neural Networks" <https://arxiv.org/pdf/1611.05431.pdf>`_.
+    Args:
+        pretrained (bool): If True, returns a model pre-trained on ImageNet
+        progress (bool): If True, displays a progress bar of the download to stderr
+    """
+    kwargs['groups'] = 32
+    kwargs['width_per_group'] = 4
+    return _resnet(MishResNet, MishBottleneck, [3, 4, 6, 3],**kwargs)
+
+
+def replace_activations(model, activation):
+    """
+    Allow custom activation with pretrained Resnet model
+    """
+    model.relu = activation
+    for module in model.layer1:
+        module.relu = activation
+    for module in model.layer2:
+        module.relu = activation
+    for module in model.layer3:
+        module.relu = activation
+    for module in model.layer4:
+        module.relu = activation
+
+    print(model)
+
+    return None
+
 
 
 

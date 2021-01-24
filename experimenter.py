@@ -6,15 +6,16 @@ import copy
 
 from tqdm import tqdm
 
-from loss import BiTemperedLogisticLoss
+from loss import BiTemperedLogisticLoss, SnapMix, SnapMixLoss
 import torch.optim as optim
+import numpy as np
 
 class Experimenter:
     """
     Class to construct Pytorch experiment
     """
 
-    def __init__(self, model, model_name, device, loss_function, optimiser, lr_scheduler, dataset, num_epochs, num_classes, early_stopping=True, patience=3, tta=5):
+    def __init__(self, model, model_name, device, loss_function, optimiser, optimiser_config, lr_scheduler, lr_config, warmup_scheduler, dataset, num_epochs, num_classes, img_size, flatness=12, early_stopping=True, patience=3, tta=5, snapmix=None):
         """
         Add some fun hyperparameters
         :param model: The model we want to experiment with
@@ -34,8 +35,15 @@ class Experimenter:
         self.device = device
         self.loss_function = loss_function
 
+        self.init_optimiser = optimiser
+        self.optimiser_config = optimiser_config
+        self.init_lr_scheduler = lr_scheduler
+        self.lr_config = lr_config
+
         self.optimiser = optimiser
-        self.lr_scheduler = lr_scheduler
+        self.lr_scheduler = lr_scheduler(self.optimiser, **self.lr_config)
+
+        self.warmup_scheduler = warmup_scheduler(optimiser)
 
         self.dataset = dataset
         self.num_epochs = num_epochs
@@ -44,6 +52,20 @@ class Experimenter:
         self.one_hot = False
         self.tta = tta
         self.num_classes = num_classes
+        self.flatness = flatness
+        self.flatness_counter = 0
+
+        self.scaler = torch.cuda.amp.GradScaler()
+
+        self.img_size = img_size
+
+        if snapmix is None:
+            self.snapmix = None
+        else:
+            self.snapmix = SnapMix()
+            self.snapmix_prob = snapmix['prob']
+            self.snapmix_alpha = snapmix['alpha']
+            self.snapmix_loss = SnapMixLoss()
 
         if type(self.loss_function) == BiTemperedLogisticLoss:
             print("one hot")
@@ -69,22 +91,48 @@ class Experimenter:
                 self.optimiser.zero_grad()
 
                 # forward pass
-                with torch.set_grad_enabled(True):
+                with torch.cuda.amp.autocast():
+
+
                     # Get model outputs and calculate loss
-                    outputs = self.model(inputs)
                     if self.one_hot:
+
                         one_hot_labels = torch.zeros(len(labels), self.num_classes).cuda()
                         one_hot_labels[range(one_hot_labels.shape[0]), labels] = 1
-                        loss = self.loss_function(outputs, one_hot_labels)
+
+                        if self.snapmix is not None:
+                            # do the snapmix thing
+                            rand = np.random.rand()
+                            if rand > (1.0 - self.snapmix_prob):
+                                X, ya, yb, lam_a, lam_b = self.snapmix(inputs, one_hot_labels, self.snapmix_alpha, self.img_size, self.model)
+                                outputs, _ = self.model(X)
+                                loss = self.snapmix_loss.forward(self.loss_function, outputs, ya, yb, lam_a, lam_b)
+
+                            else:
+                                outputs, _ = self.model(inputs)
+                                loss = self.loss_function(outputs, one_hot_labels)
+                        else:
+                            outputs = self.model(inputs)
+                            loss = self.loss_function(outputs, one_hot_labels)
+
                     else:
+                        outputs = self.model(inputs)
                         loss = self.loss_function(outputs, labels)
 
                     # make predictions
                     _, preds = torch.max(outputs, 1)
 
-                    # backward pass and parameter optimisation
-                    loss.backward()
-                    self.optimiser.step()
+                    # backward pass and parameter optimisation, with autoscaling
+                    self.scaler.scale(loss).backward()
+                    self.scaler.step(self.optimiser)
+                    self.scaler.update()
+
+                    # learning rate scheduling
+                    self.lr_scheduler.step()
+                    if self.flatness_counter >= self.flatness:
+                        self.lr_scheduler.step()
+                        self.warmup_scheduler.dampen()
+
 
                 # update loss and predictions
                 cumulative_loss += loss.item() * inputs.size(0)
@@ -116,19 +164,10 @@ class Experimenter:
                 # zero the parameter gradients
                 self.optimiser.zero_grad()
 
-                tta_individuals = torch.zeros((self.dataset.batch_size, self.num_classes)).cuda()
-
-                # we do test time augmentation for validation
-                for tta_ix in range(self.tta):
-
-                    # forward pass
-                    with torch.set_grad_enabled(False):
-                        # Get model outputs and calculate loss
-                        outputs = self.model(inputs)
-                        tta_individuals += outputs
-
-                # average the model predictions against augmentations
-                outputs = tta_individuals / self.tta
+                # forward pass
+                with torch.set_grad_enabled(False):
+                    # Get model outputs and calculate loss
+                    outputs = self.model(inputs)
 
                 # one hot encode the labels for bi-tempered logistic loss
                 if self.one_hot:
@@ -165,12 +204,17 @@ class Experimenter:
             stopped_early = False
             stopped_epoch = 10
 
+            flatness_counter = 0
+
             # instantiate and send the model to GPU
             self.model.load_state_dict(self.init_model)
+            print(self.device)
+            self.model = self.model.to(self.device)
+            print(next(self.model.parameters()).device)
 
             # initialise optimiser and lr scheduler
-            self.optimiser = optim.Adam(self.model.parameters(), lr=5e-4)
-            self.lr_scheduler = torch.optim.lr_scheduler.StepLR(self.optimiser, step_size=5, gamma=0.1) # TODO make dynamic
+            #self.optimiser = self.init_optimiser(self.model.parameters(), **self.optimiser_config)
+            #self.lr_scheduler = self.init_lr_scheduler(self.optimiser, **self.lr_config)
 
 
             train_data, val_data = self.dataset.get_split(fold)
@@ -215,7 +259,7 @@ class Experimenter:
                 print(f"Validation loss - Epoch {epoch+1}/{self.num_epochs}: {val_loss}")
                 print(f"Validation accuracy - Epoch {epoch+1}/{self.num_epochs}: {val_acc}")
 
-                self.lr_scheduler.step()
+                self.flatness_counter += 1
 
                 if val_acc > best_acc:
                     # keep a copy of the best performing model parameters

@@ -3,6 +3,8 @@ import torch
 
 import torch.nn.functional as F
 
+import numpy as np
+
 
 class BiTemperedLogisticLoss(Module):
     """
@@ -10,7 +12,7 @@ class BiTemperedLogisticLoss(Module):
     Helps to train and generalise in the presence of noisy data, which is true in cassava competition
     """
 
-    def __init__(self, t1 = 0.5, t2 = 4., *args, **kwargs):
+    def __init__(self, t1 = 0.2, t2 = 1.2, *args, **kwargs):
         """
         Initiliase class with temperature params
         :param args:
@@ -45,7 +47,7 @@ class BiTemperedLogisticLoss(Module):
 
         # avoid divide by zero
         if t != 1.:
-            return F.relu((1. - t) * x  + 1.)** (1. / (1. - t))
+            return F.relu((1. - t) * x  + 1.) ** (1. / (1. - t))
         else:
             return torch.exp(x)
 
@@ -136,6 +138,119 @@ class BiTemperedLogisticLoss(Module):
         out = torch.sum(loss, dim=-1)
 
         return torch.mean(out)
+
+"""
+Snapmix augmentation and loss, loosely from https://www.kaggle.com/sachinprabhu/pytorch-resnet50-snapmix-train-pipeline
+"""
+
+class SnapMix:
+    """
+    Class implementing the snapmix augmentation https://arxiv.org/abs/2012.04846
+    """
+    def rand_bbox(self, size, lam):
+        W = size[2]
+        H = size[3]
+        cut_rat = np.sqrt(1. - lam)
+        cut_w = np.int(W * cut_rat)
+        cut_h = np.int(H * cut_rat)
+
+        # uniform
+        cx = np.random.randint(W)
+        cy = np.random.randint(H)
+
+        bbx1 = np.clip(cx - cut_w // 2, 0, W)
+        bby1 = np.clip(cy - cut_h // 2, 0, H)
+        bbx2 = np.clip(cx + cut_w // 2, 0, W)
+        bby2 = np.clip(cy + cut_h // 2, 0, H)
+
+        return bbx1, bby1, bbx2, bby2
+
+    def get_spm(self, input, target, model, img_size):
+        imgsize = (img_size, img_size)
+        bs = input.size(0)
+        with torch.no_grad():
+            output, fms = model(input)
+            clsw = model.fc.linear
+            weight = clsw.weight.data
+            bias = clsw.bias.data
+            weight = weight.view(weight.size(0), weight.size(1), 1, 1)
+            fms = F.relu(fms)
+            poolfea = F.adaptive_avg_pool2d(fms, (1, 1)).squeeze()
+            clslogit = F.softmax(clsw.forward(poolfea))
+            logitlist = []
+            for i in range(bs):
+                logitlist.append(clslogit[i, (target[i] == 1.).nonzero().item()])
+            clslogit = torch.stack(logitlist)
+
+            out = F.conv2d(fms, weight, bias=bias)
+
+            outmaps = []
+            for i in range(bs):
+                evimap = out[i, (target[i] == 1.).nonzero().item()]
+                outmaps.append(evimap)
+
+            outmaps = torch.stack(outmaps)
+
+            if imgsize is not None:
+                outmaps = outmaps.view(outmaps.size(0), 1, outmaps.size(1), outmaps.size(2))
+                outmaps = F.interpolate(outmaps, imgsize, mode='bilinear', align_corners=False)
+
+            outmaps = outmaps.squeeze()
+
+            for i in range(bs):
+                outmaps[i] -= outmaps[i].min()
+                outmaps[i] /= outmaps[i].sum()
+
+        return outmaps, clslogit
+
+    def __call__(self, input, target, alpha, img_size, model=None):
+
+        r = np.random.rand(1)
+        lam_a = torch.ones(input.size(0))
+        lam_b = 1 - lam_a
+        target_b = target.clone()
+
+        if True:
+            wfmaps, _ = self.get_spm(input, target, model, img_size)
+            bs = input.size(0)
+            lam = np.random.beta(alpha, alpha)
+            lam1 = np.random.beta(alpha, alpha)
+            rand_index = torch.randperm(bs).cuda()
+            wfmaps_b = wfmaps[rand_index, :, :]
+            target_b = target[rand_index]
+
+            same_label = torch.equal(target, target_b)
+            bbx1, bby1, bbx2, bby2 = self.rand_bbox(input.size(), lam)
+            bbx1_1, bby1_1, bbx2_1, bby2_1 = self.rand_bbox(input.size(), lam1)
+
+            area = (bby2 - bby1) * (bbx2 - bbx1)
+            area1 = (bby2_1 - bby1_1) * (bbx2_1 - bbx1_1)
+
+            if area1 > 0 and area > 0:
+                ncont = input[rand_index, :, bbx1_1:bbx2_1, bby1_1:bby2_1].clone()
+                ncont = F.interpolate(ncont, size=(bbx2 - bbx1, bby2 - bby1), mode='bilinear', align_corners=True)
+                input[:, :, bbx1:bbx2, bby1:bby2] = ncont
+                lam_a = 1 - wfmaps[:, bbx1:bbx2, bby1:bby2].sum(2).sum(1) / (wfmaps.sum(2).sum(1) + 1e-8)
+                lam_b = wfmaps_b[:, bbx1_1:bbx2_1, bby1_1:bby2_1].sum(2).sum(1) / (wfmaps_b.sum(2).sum(1) + 1e-8)
+                tmp = lam_a.clone()
+                lam_a[same_label] += lam_b[same_label]
+                lam_b[same_label] += tmp[same_label]
+                lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (input.size()[-1] * input.size()[-2]))
+                lam_a[torch.isnan(lam_a)] = lam
+                lam_b[torch.isnan(lam_b)] = 1 - lam
+
+        return input, target, target_b, lam_a.cuda(), lam_b.cuda()
+
+
+class SnapMixLoss(Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, criterion, outputs, ya, yb, lam_a, lam_b):
+        loss_a = criterion(outputs, ya)
+        loss_b = criterion(outputs, yb)
+        loss = torch.mean(loss_a * lam_a + loss_b * lam_b)
+        return loss
 
 
 
