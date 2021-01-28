@@ -15,7 +15,9 @@ class Experimenter:
     Class to construct Pytorch experiment
     """
 
-    def __init__(self, model, model_name, device, loss_function, optimiser, optimiser_config, lr_scheduler, lr_config, warmup_scheduler, dataset, num_epochs, num_classes, img_size, flatness=12, early_stopping=True, patience=3, tta=5, snapmix=None):
+    def __init__(self, model, model_name, device, loss_function, optimiser, optimiser_config, lr_scheduler,
+                 lr_config, dataset, data_batch_size, training_batch_size, num_epochs, num_classes, img_size,
+                 warmup_scheduler=None, flatness=12, early_stopping=True, patience=3, tta=5, snapmix=None):
         """
         Add some fun hyperparameters
         :param model: The model we want to experiment with
@@ -43,7 +45,10 @@ class Experimenter:
         self.optimiser = optimiser
         self.lr_scheduler = lr_scheduler(self.optimiser, **self.lr_config)
 
-        self.warmup_scheduler = warmup_scheduler(optimiser)
+        if warmup_scheduler is not None:
+            self.warmup_scheduler = warmup_scheduler(optimiser)
+        else:
+            self.warmup_scheduler = None
 
         self.dataset = dataset
         self.num_epochs = num_epochs
@@ -67,6 +72,8 @@ class Experimenter:
             self.snapmix_alpha = snapmix['alpha']
             self.snapmix_loss = SnapMixLoss()
 
+        self.grad_accum = training_batch_size // data_batch_size
+
         if type(self.loss_function) == BiTemperedLogisticLoss:
             print("one hot")
             self.one_hot = True
@@ -81,14 +88,16 @@ class Experimenter:
         cumulative_loss = 0.0
         correct_preds = 0
 
+        batch_loss = 0
+
+        # zero the parameter gradients
+        self.optimiser.zero_grad()
+
         with tqdm(train_data, unit="batch") as tepoch:
-            for inputs, labels in tepoch:
+            for i, (inputs, labels) in enumerate(tepoch):
 
                 inputs = inputs.to(self.device)
                 labels = labels.to(self.device)
-
-                # zero the parameter gradients
-                self.optimiser.zero_grad()
 
                 # forward pass
                 with torch.cuda.amp.autocast():
@@ -97,7 +106,7 @@ class Experimenter:
                     # Get model outputs and calculate loss
                     if self.one_hot:
 
-                        one_hot_labels = torch.zeros(len(labels), self.num_classes).cuda()
+                        one_hot_labels = torch.zeros(inputs.size(0), self.num_classes).cuda()
                         one_hot_labels[range(one_hot_labels.shape[0]), labels] = 1
 
                         if self.snapmix is not None:
@@ -112,26 +121,39 @@ class Experimenter:
                                 outputs, _ = self.model(inputs)
                                 loss = self.loss_function(outputs, one_hot_labels)
                         else:
-                            outputs = self.model(inputs)
+                            outputs, _ = self.model(inputs)
                             loss = self.loss_function(outputs, one_hot_labels)
 
                     else:
                         outputs = self.model(inputs)
                         loss = self.loss_function(outputs, labels)
 
-                    # make predictions
-                    _, preds = torch.max(outputs, 1)
+                    loss = loss / self.grad_accum
 
+                #batch_loss += loss.item()
+
+                self.scaler.scale(loss).backward()
+
+                # make predictions
+                _, preds = torch.max(outputs, 1)
+
+                if (i + 1) % self.grad_accum == 0:  # Wait for several backward steps
                     # backward pass and parameter optimisation, with autoscaling
-                    self.scaler.scale(loss).backward()
                     self.scaler.step(self.optimiser)
                     self.scaler.update()
+                    # zero the parameter gradients
+                    self.optimiser.zero_grad()
 
                     # learning rate scheduling
-                    self.lr_scheduler.step()
                     if self.flatness_counter >= self.flatness:
                         self.lr_scheduler.step()
-                        self.warmup_scheduler.dampen()
+                        if self.warmup_scheduler is not None:
+                            self.warmup_scheduler.dampen()
+
+                    #cumulative_loss += batch_loss * inputs.size(0) * self.grad_accum
+                    #tepoch.set_postfix(loss=batch_loss)
+                    #batch_loss = 0.
+
 
 
                 # update loss and predictions
@@ -139,6 +161,7 @@ class Experimenter:
                 correct_preds += torch.sum(preds == labels.data).item()
 
                 tepoch.set_postfix(loss=loss.item())
+
 
             epoch_loss = cumulative_loss / len(train_data.dataset)
             epoch_acc = correct_preds / len(train_data.dataset)
@@ -161,13 +184,13 @@ class Experimenter:
                 inputs = inputs.to(self.device)
                 labels = labels.to(self.device)
 
-                # zero the parameter gradients
-                self.optimiser.zero_grad()
-
                 # forward pass
                 with torch.set_grad_enabled(False):
                     # Get model outputs and calculate loss
-                    outputs = self.model(inputs)
+                    if self.snapmix is not None:
+                        outputs, _ = self.model(inputs)
+                    else:
+                        outputs = self.model(inputs)
 
                 # one hot encode the labels for bi-tempered logistic loss
                 if self.one_hot:
@@ -201,26 +224,26 @@ class Experimenter:
 
         for fold in range(self.dataset.k):
 
+            # allows us to check when early stopping kicked in
             stopped_early = False
             stopped_epoch = 10
 
-            flatness_counter = 0
-
             # instantiate and send the model to GPU
             self.model.load_state_dict(self.init_model)
-            print(self.device)
             self.model = self.model.to(self.device)
-            print(next(self.model.parameters()).device)
 
             # initialise optimiser and lr scheduler
             #self.optimiser = self.init_optimiser(self.model.parameters(), **self.optimiser_config)
             #self.lr_scheduler = self.init_lr_scheduler(self.optimiser, **self.lr_config)
 
 
+            # get the dataset split
             train_data, val_data = self.dataset.get_split(fold)
 
-            start = time.time()
 
+            # keep track of the time, and initiate an early stopping counter (which records how many epochs val acc
+            # has not increased for)
+            start = time.time()
             early_stopping_counter = 0
 
             # keep losses and accuracies to plot training afterwards
@@ -231,9 +254,11 @@ class Experimenter:
                 'val_accs': []
             }
 
+            # we will want to keep the best model
             best_model_params = copy.deepcopy(self.model.state_dict())
             best_acc = 0.0
 
+            # iterate through the epochs
             for epoch in range(self.num_epochs):
                 print(f"Epoch {epoch+1}/{self.num_epochs}\n")
 
@@ -259,6 +284,7 @@ class Experimenter:
                 print(f"Validation loss - Epoch {epoch+1}/{self.num_epochs}: {val_loss}")
                 print(f"Validation accuracy - Epoch {epoch+1}/{self.num_epochs}: {val_acc}")
 
+                # update the flatness counter to check whether to kick in the lr scheduler
                 self.flatness_counter += 1
 
                 if val_acc > best_acc:
@@ -273,13 +299,14 @@ class Experimenter:
                     # if validation accuracy goes down too much, model is overfitting so no point continuing
                     early_stopping_counter += 1
 
-
+                # if val acc has not increased for a few epochs, end the training loop
                 if early_stopping_counter == self.patience and self.early_stopping:
                     stopped_early = True
                     stopped_epoch = epoch
 
                     break
 
+            # print some final training stats
             end = time.time() - start
             if stopped_early:
                 print(f"Stopped training early after Epoch {stopped_epoch}")
@@ -288,6 +315,6 @@ class Experimenter:
             print(f"Best validation accuracy: {best_acc:4f}")
 
 
-            # load best model weights
+            # save the best model from the training loop
             self.model.load_state_dict(best_model_params)
             torch.save(self.model, f"{self.model_name}_{fold}.pt")
