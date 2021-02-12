@@ -144,12 +144,6 @@ class Experimenter:
                     # zero the parameter gradients
                     self.optimiser.zero_grad()
 
-                    # learning rate scheduling
-                    if self.flatness_counter >= self.flatness:
-                        self.lr_scheduler.step()
-                        if self.warmup_scheduler is not None:
-                            self.warmup_scheduler.dampen()
-
                     #cumulative_loss += batch_loss * inputs.size(0) * self.grad_accum
                     #tepoch.set_postfix(loss=batch_loss)
                     #batch_loss = 0.
@@ -283,6 +277,12 @@ class Experimenter:
 
                 print(f"Validation loss - Epoch {epoch+1}/{self.num_epochs}: {val_loss}")
                 print(f"Validation accuracy - Epoch {epoch+1}/{self.num_epochs}: {val_acc}")
+
+                # learning rate scheduling
+                if self.flatness_counter >= self.flatness:
+                    self.lr_scheduler.step()
+                    if self.warmup_scheduler is not None:
+                        self.warmup_scheduler.dampen()
 
                 # update the flatness counter to check whether to kick in the lr scheduler
                 self.flatness_counter += 1

@@ -12,7 +12,7 @@ class BiTemperedLogisticLoss(Module):
     Helps to train and generalise in the presence of noisy data, which is true in cassava competition
     """
 
-    def __init__(self, t1 = 0.2, t2 = 1.2, *args, **kwargs):
+    def __init__(self, t1 = 0.2, t2 = 1.2, label_smoothing=0.05, *args, **kwargs):
         """
         Initiliase class with temperature params
         :param args:
@@ -22,6 +22,7 @@ class BiTemperedLogisticLoss(Module):
         super().__init__(*args, **kwargs)
         self.t1 = t1
         self.t2 = t2
+        self.label_smoothing = label_smoothing
 
     def log_t(self, x, t):
         """
@@ -124,6 +125,11 @@ class BiTemperedLogisticLoss(Module):
         :param targets: The target labels
         :return:
         """
+
+        if self.label_smoothing > 0.0:
+            num_classes = targets.shape[-1]
+            targets = (1 - num_classes / (num_classes - 1) * self.label_smoothing) * targets + self.label_smoothing / (
+                        num_classes - 1)
 
         norm_constants = self.lambda_t_a(inputs, self.t2)
 
