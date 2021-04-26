@@ -11,11 +11,13 @@ I then constructed a baseline model, fine-tuning a Resnext-50 net that was pretr
 As identified by other participants, the dataset was inherently noisy. Many images were mislabelled, or could reasonably have belonged to multiple classes. To combat this, I tried using some novel loss functions designed to smooth out label noise during training.
 
 Bi-tempered logistic loss: https://arxiv.org/pdf/1906.03361.pdf
+
 Taylor cross entropy loss: https://www.ijcai.org/Proceedings/2020/0305.pdf (Implementation: https://github.com/CoinCheung/pytorch-loss/blob/master/pytorch_loss/taylor_softmax.py)
 
 I also tried a number of different activation functions in place of the standard ReLU, mainly because I had heard on the TWIMLAI podcast that some emergent activation functions were outperforming ReLU, especially in the presence of data noise or highly periodic data. In particular, I tried the following:
 
 Mish activation function: https://arxiv.org/vc/arxiv/papers/1908/1908.08681v1.pdf
+
 SIREN activation function: https://arxiv.org/pdf/2006.09661.pdf
 
 I also tried using weight standardisation as opposed to batch normalisation, as I had felt during initial experiments on my laptop that the small batch size was negatively impacting performance. However, I eventually found that gradient accumulation was a more effective solution to this problem.
